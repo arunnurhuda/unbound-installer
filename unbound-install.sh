@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ================== PARAM ==================
-BIND_IP="${BIND_IP:-157.0.0.1}"   # ganti via env: BIND_IP=1.2.3.4 ./install-unbound-ip.sh
+BIND_IP="${BIND_IP:-157.0.0.1}"   # override: BIND_IP=10.10.10.53 ./install-unbound-ip.sh
 ALLOW_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
-ENABLE_IPV6="no"                     # "yes" kalau mau v6
+ENABLE_IPV6="${ENABLE_IPV6:-no}"     # "yes" kalau mau v6 (butuh ip v6 aktif di host)
 # ==========================================
 
 echo "[0/10] Using BIND_IP=${BIND_IP}"
@@ -23,7 +23,7 @@ DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
 echo "[2/10] Install paket..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   ca-certificates curl wget gnupg lsb-release \
-  dnsutils net-tools coreutils \
+  dnsutils net-tools coreutils iproute2 \
   unbound unbound-anchor unbound-host
 
 echo "[3/10] Matikan DNSStubListener & set resolver sementara..."
@@ -57,17 +57,22 @@ chmod 0640 /var/lib/unbound/root.key
 
 echo "[6/10] Bersihin config lama & tulis /etc/unbound/unbound.conf ..."
 mkdir -p /etc/unbound/unbound.conf.d
-# backup config lama kalau ada
 [[ -f /etc/unbound/unbound.conf ]] && cp -a /etc/unbound/unbound.conf /etc/unbound/unbound.conf.bak.$(date +%F-%H%M) || true
-# kosongkan drop-ins lama biar gak dobel anchor
 rm -f /etc/unbound/unbound.conf.d/* || true
+
+# Optional: warning kalau IP belum ada di host
+if ! ip -4 addr show | grep -qw "${BIND_IP}"; then
+  echo "WARN: ${BIND_IP} belum ter-assign di host ini. Pastikan IP ada di interface."
+fi
 
 {
   echo "server:"
   echo "  username: \"unbound\""
   echo "  directory: \"/etc/unbound\""
   echo ""
+  echo "  # Listen di IP publik & loopback (biar bisa query lokal tanpa REFUSED)"
   echo "  interface: ${BIND_IP}"
+  echo "  interface: 127.0.0.1"
   if [[ "${ENABLE_IPV6}" == "yes" ]]; then
     echo "  interface: ::0"
     echo "  do-ip6: yes"
@@ -78,6 +83,7 @@ rm -f /etc/unbound/unbound.conf.d/* || true
   echo "  do-udp: yes"
   echo "  do-tcp: yes"
   echo ""
+  echo "  # Good defaults"
   echo "  qname-minimisation: yes"
   echo "  prefetch: yes"
   echo "  hide-identity: yes"
@@ -85,24 +91,32 @@ rm -f /etc/unbound/unbound.conf.d/* || true
   echo "  cache-min-ttl: 60"
   echo "  cache-max-ttl: 86400"
   echo ""
-  # ACL allow
+  echo "  # ACL — izinkan IP server sendiri & LANs"
+  echo "  access-control: ${BIND_IP}/32 allow"
+  echo "  access-control: 127.0.0.0/8 allow"
   for a in "${ALLOW_NETS[@]}"; do
+    [[ "$a" == "127.0.0.0/8" ]] && continue
     echo "  access-control: ${a} allow"
   done
-  # NOTE: default refuse publik → bukan open resolver
+  if [[ "${ENABLE_IPV6}" == "yes" ]]; then
+    echo "  access-control: ::1 allow"
+  fi
+  echo "  # Default refuse publik (bukan open resolver)"
   echo "  access-control: 0.0.0.0/0 refuse"
   if [[ "${ENABLE_IPV6}" == "yes" ]]; then
     echo "  access-control: ::0/0 refuse"
   fi
   echo ""
+  echo "  # DNSSEC trust anchor"
   echo "  auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
   echo ""
   echo "remote-control:"
   echo "  control-enable: yes"
-  # keep LOCAL ONLY (aman). Kalau mau dari remote, ubah ke ${BIND_IP} + firewall ketat
   echo "  control-interface: 127.0.0.1"
-  [[ "${ENABLE_IPV6}" == "yes" ]] && echo "  control-interface: ::1"
-  echo "  control-use-cert: no"
+  if [[ "${ENABLE_IPV6}" == "yes" ]]; then
+    echo "  control-interface: ::1"
+  fi
+  echo "  control-use-cert: no   # local-only; simple & anti drama"
   echo ""
   echo "include: \"/etc/unbound/unbound.conf.d/*.conf\""
 } > /etc/unbound/unbound.conf
@@ -129,5 +143,5 @@ dig @${BIND_IP} cloudflare.com A +short || true
 systemctl status unbound --no-pager | tail -n 10
 
 echo "✅ Selesai. Unbound listen di ${BIND_IP}:53 (IPv6: ${ENABLE_IPV6})."
-echo "   Client LAN silakan point DNS ke ${BIND_IP}."
-echo "   Remote-control: local only (127.0.0.1)."
+echo "   Client LAN: arahkan DNS ke ${BIND_IP}."
+echo "   Admin RC: local-only di 127.0.0.1 (tanpa TLS)."
